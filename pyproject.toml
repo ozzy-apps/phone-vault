@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phone-vault"
+dynamic = ["version"]
+description = "Back up the files on your Android phone and sort them: camera photos, screenshots, chat media, downloads."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Ozzy" }]
+dependencies = ["PySide6>=6.5", "Pillow>=9.5"]
+
+[project.optional-dependencies]
+heic = ["pillow-heif>=0.13"]
+dev = ["pytest>=7"]
+
+[project.gui-scripts]
+phone-vault = "phonevault.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "phonevault.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["phonevault*"]
+
+[tool.setuptools.package-data]
+phonevault = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

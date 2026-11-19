@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Phone Vault
+GenericName=Phone backup
+Comment=Back up and sort the files on your phone
+Exec=@EXEC@
+Icon=phone-vault
+Terminal=false
+Categories=Utility;FileTools;
+Keywords=phone;android;backup;photos;screenshots;whatsapp;adb;mtp;
+StartupWMClass=phone-vault
