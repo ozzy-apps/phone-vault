@@ -130,6 +130,14 @@ class MediaFile:
     taken_at: datetime | None = None
     date_source: str = ""
 
+    # Filled from the backup index.
+    backup_dest: str = ""
+    backed_up_at: str = ""
+
+    @property
+    def backed_up(self) -> bool:
+        return bool(self.backup_dest)
+
     @classmethod
     def from_entry(cls, entry: RemoteEntry) -> "MediaFile":
         name = posixpath.basename(entry.rel_path)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
@@ -17,14 +19,20 @@ from .themes import Theme
 from .workers import load_preview, run_task
 
 _KIND_ICON = {Kind.IMAGE: "image", Kind.VIDEO: "video", Kind.AUDIO: "audio"}
+
+
+def _tilde(path: str) -> str:
+    home = str(Path.home())
+    return "~" + path[len(home):] if path.startswith(home + "/") else path
 PREVIEW_BOX = QSize(640, 640)
 
 
 class DetailsPanel(QFrame):
     open_requested = Signal(object)
     reveal_requested = Signal(object)
+    reveal_backup_requested = Signal(object)
 
-    FIELDS = ("Category", "Match", "Why", "Origin", "Date", "Camera", "Dimensions", "Size", "On phone")
+    FIELDS = ("Category", "Match", "Why", "Origin", "Date", "Camera", "Dimensions", "Size", "On phone", "Backup")
 
     def __init__(self, theme: Theme, parent=None):
         super().__init__(parent)
@@ -95,14 +103,21 @@ class DetailsPanel(QFrame):
         root.addStretch(1)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(6)
         self.open_btn = QPushButton("Open")
         self.open_btn.clicked.connect(lambda: self._file and self.open_requested.emit(self._file))
         self.reveal_btn = QPushButton("Show in folder")
         self.reveal_btn.clicked.connect(lambda: self._file and self.reveal_requested.emit(self._file))
+        self.backup_btn = QPushButton("Show backup")
+        self.backup_btn.clicked.connect(lambda: self._file and self.reveal_backup_requested.emit(self._file))
         buttons.addWidget(self.open_btn)
         buttons.addWidget(self.reveal_btn)
         buttons.addStretch(1)
         root.addLayout(buttons)
+        second = QHBoxLayout()
+        second.addWidget(self.backup_btn)
+        second.addStretch(1)
+        root.addLayout(second)
         self.set_theme(theme)
         self.clear()
 
@@ -112,6 +127,7 @@ class DetailsPanel(QFrame):
         self.info_toggle.setIcon(icons.icon("chevron-down" if self._info_open else "chevron-right", theme.text_muted))
         self.open_btn.setIcon(icons.icon("open", theme.text))
         self.reveal_btn.setIcon(icons.icon("folder", theme.text))
+        self.backup_btn.setIcon(icons.icon("folder", theme.text))
         if self._file is not None and self._image is None:
             self._show_placeholder(self._file)
         self._refresh_match_color()
@@ -137,6 +153,7 @@ class DetailsPanel(QFrame):
         self.reveal_btn.setEnabled(False)
         self.open_btn.hide()
         self.reveal_btn.hide()
+        self.backup_btn.hide()
 
     def show_selection(self, files: list[MediaFile]) -> None:
         if not files:
@@ -148,6 +165,12 @@ class DetailsPanel(QFrame):
         self.clear()
         self.name.setText(f"{len(files):,} files selected")
         self.caption.setText(f"{human_size(sum(f.size for f in files))} in total")
+
+    def refresh(self) -> None:
+        """Re-read the current file's fields (e.g. after a backup)."""
+        if self._file is not None:
+            self._fill(self._file)
+            self.backup_btn.setVisible(self._file.backed_up)
 
     def show_file(self, f: MediaFile) -> None:
         self._file = f
@@ -162,7 +185,8 @@ class DetailsPanel(QFrame):
         self.info.setVisible(self._info_open)
         self._fill(f)
         self.open_btn.show()
-        self.reveal_btn.show()
+        self.reveal_btn.setVisible(self._source is not None and self._source.local_path(f.rel_path) is not None)
+        self.backup_btn.setVisible(f.backed_up)
         self.open_btn.setEnabled(self._source is not None)
         self.reveal_btn.setEnabled(self._source is not None and self._source.local_path(f.rel_path) is not None)
         self.preview.show()
@@ -193,6 +217,12 @@ class DetailsPanel(QFrame):
         v["Dimensions"].setText(f"{width} × {height}" if width and height else "—")
         v["Size"].setText(f"{human_size(f.size)}  ({f.size:,} bytes)")
         v["On phone"].setText(f.rel_path)
+        if f.backed_up:
+            v["Backup"].setText(f"Backed up {f.backed_up_at.replace('T', ' ')[:16]}\n{_tilde(f.backup_dest)}")
+            v["Backup"].setStyleSheet(f"color: {self.theme.accent};")
+        else:
+            v["Backup"].setText("Not backed up")
+            v["Backup"].setStyleSheet("")
         self._refresh_match_color()
 
     def _refresh_match_color(self) -> None:

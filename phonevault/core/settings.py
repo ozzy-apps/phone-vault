@@ -38,6 +38,14 @@ class Settings:
     metadata_mode: str = "smart"
     own_cameras: list[str] = field(default_factory=list)
 
+    # Backup
+    backup_root: str = ""  # empty = ~/Phone Vault
+    backup_layout: str = "category"
+    backup_verify: str = "size"
+    backup_skip_categories: list[str] = field(default_factory=list)
+    backup_skip_sent: bool = False
+    device_folders: dict[str, str] = field(default_factory=dict)  # source key -> archive folder name
+
     # Scanning
     exclude_patterns: list[str] = field(
         default_factory=lambda: ["Android/data", "Android/obb", ".thumbnails", ".trashed-*", ".nomedia"]
@@ -74,6 +82,12 @@ class Settings:
             s.grid_size = "M"
         if s.sort_key not in ("date", "name", "size"):
             s.sort_key = "date"
+        if s.backup_layout not in ("category", "date", "phone"):
+            s.backup_layout = "category"
+        if s.backup_verify not in ("size", "checksum"):
+            s.backup_verify = "size"
+        if not isinstance(s.device_folders, dict):
+            s.device_folders = {}
         return s
 
     def save(self) -> None:
@@ -85,6 +99,9 @@ class Settings:
 
     def copy(self) -> "Settings":
         return Settings(**json.loads(json.dumps(asdict(self))))
+
+    def backup_root_path(self) -> Path:
+        return Path(self.backup_root).expanduser() if self.backup_root else Path.home() / "Phone Vault"
 
     def remember_folder(self, folder: str) -> None:
         if folder in self.recent_folders:

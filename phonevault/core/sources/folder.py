@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -69,3 +70,16 @@ class FolderSource(Source):
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.local_path(rel_path), dest)
         return dest
+
+    def remote_hashes(self, rel_paths: list[str]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for rel in rel_paths:
+            h = hashlib.sha256()
+            try:
+                with open(self.local_path(rel), "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+            except OSError:
+                continue
+            out[rel] = h.hexdigest()
+        return out

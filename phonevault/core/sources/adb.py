@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import posixpath
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Iterator
 
@@ -15,18 +18,42 @@ from .base import CancelFn, DeviceInfo, ProgressFn, Source, SourceError
 STORAGE_ROOT = "/storage/emulated/0"
 
 
+SDK_ADB_CANDIDATES = (
+    "~/Android/Sdk/platform-tools/adb",
+    "~/Android/sdk/platform-tools/adb",
+    "/opt/android-sdk/platform-tools/adb",
+    "/usr/lib/android-sdk/platform-tools/adb",
+)
+
+ADB_STATES = (
+    "device", "unauthorized", "offline", "no permissions", "authorizing", "connecting",
+    "recovery", "sideload", "bootloader", "rescue", "host",
+)
+
+
+def adb_candidates() -> list[str]:
+    """Every adb on this machine, Android SDK copies first (they are newer than distro packages)."""
+    found: list[str] = []
+    for candidate in SDK_ADB_CANDIDATES:
+        p = Path(candidate).expanduser()
+        if p.is_file() and str(p) not in found:
+            found.append(str(p))
+    on_path = shutil.which("adb")
+    if on_path:
+        real = str(Path(on_path).resolve())
+        if on_path not in found and real not in found:
+            found.append(on_path)
+    return found
+
+
 def find_adb(configured: str = "") -> str | None:
+    """The adb to use. An Android SDK adb wins over the distro one: running two different adb
+    versions makes them kill each other's server, so the phone keeps disappearing."""
     if configured:
         p = Path(configured).expanduser()
         return str(p) if p.is_file() else None
-    found = shutil.which("adb")
-    if found:
-        return found
-    for candidate in ("~/Android/Sdk/platform-tools/adb", "/usr/lib/android-sdk/platform-tools/adb"):
-        p = Path(candidate).expanduser()
-        if p.is_file():
-            return str(p)
-    return None
+    candidates = adb_candidates()
+    return candidates[0] if candidates else None
 
 
 def _run(args: list[str], timeout: float = 20, binary: bool = False):
@@ -45,34 +72,66 @@ def _run(args: list[str], timeout: float = 20, binary: bool = False):
     )
 
 
-def list_adb_devices(adb: str) -> list[dict]:
-    """Parse ``adb devices -l``. Each dict: serial, state, model, product, transport."""
-    code, out, err = _run([adb, "devices", "-l"], timeout=15)
+def parse_adb_devices(out: str) -> list[dict]:
+    """Parse ``adb devices -l`` output. Each dict: serial, state, model, product, transport, emulator."""
     devices = []
-    for line in out.splitlines()[1:]:
+    for line in out.splitlines():
         line = line.strip()
-        if not line or line.startswith("*"):
+        if not line or line.startswith("*") or line.lower().startswith("list of devices"):
             continue
-        m = re.match(r"(\S+)\s+(device|unauthorized|offline|no permissions|recovery|sideload|bootloader)\b(.*)", line)
-        if not m:
+        parts = line.split(None, 1)
+        if len(parts) < 2:
             continue
-        serial, state, rest = m.groups()
-        props = dict(re.findall(r"(\w+):(\S+)", rest))
+        serial, rest = parts
+        state = next((st for st in ADB_STATES if rest.startswith(st)), "")
+        if not state:
+            continue
+        props = dict(re.findall(r"(\w+):(\S+)", rest[len(state):]))
+        emulator = serial.startswith("emulator-") or props.get("product", "").startswith(("sdk_", "sdk ")) \
+            or props.get("model", "").lower().startswith("sdk_gphone")
         devices.append(
             {
                 "serial": serial,
                 "state": state,
                 "model": props.get("model", "").replace("_", " "),
                 "product": props.get("product", ""),
-                "transport": "wifi" if ":" in serial else "usb",
+                "transport": "wifi" if ":" in serial and not emulator else "usb",
+                "emulator": emulator,
             }
         )
     return devices
 
 
+def list_adb_devices(adb: str) -> list[dict]:
+    code, out, err = _run([adb, "devices", "-l"], timeout=15)
+    return parse_adb_devices(out)
+
+
+def adb_version(adb: str) -> str:
+    try:
+        _code, out, _err = _run([adb, "version"], timeout=10)
+    except SourceError:
+        return ""
+    m = re.search(r"Version ([\w.\-]+)", out) or re.search(r"version ([\d.]+)", out)
+    return m.group(1) if m else out.strip().splitlines()[0] if out.strip() else ""
+
+
+def restart_adb_server(adb: str) -> str:
+    """kill-server + start-server; returns combined output."""
+    out = []
+    for args in ([adb, "kill-server"], [adb, "start-server"]):
+        try:
+            _c, o, e = _run(args, timeout=20)
+            out.append((o + e).strip())
+        except SourceError as exc:
+            out.append(str(exc))
+    return "\n".join(x for x in out if x)
+
+
 class AdbSource(Source):
     kind = "adb"
     parallelism = 4
+    batches = True
 
     def __init__(self, serial: str, adb: str, label: str | None = None, root: str = STORAGE_ROOT):
         self.serial = serial
@@ -161,3 +220,44 @@ class AdbSource(Source):
         if code != 0 or not dest.exists():
             raise SourceError(err.strip() or f"Could not copy {rel_path}")
         return dest
+
+    def fetch_many(self, items: list[tuple[str, Path]]) -> dict[str, str]:
+        """One ``adb pull`` for many files (basenames must be unique within ``items``)."""
+        if len(items) <= 1:
+            return super().fetch_many(items)
+        staging = Path(tempfile.mkdtemp(prefix="pull-", dir=items[0][1].parent))
+        errors: dict[str, str] = {}
+        try:
+            try:
+                _run(self._cmd("pull", "-a", *[self._remote(rel) for rel, _ in items], str(staging)), timeout=3600)
+            except SourceError:
+                pass  # files that did arrive are used; the rest is retried one by one below
+            for rel, dest in items:
+                got = staging / posixpath.basename(rel)
+                if got.exists():
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(got, dest)
+                    continue
+                try:
+                    self.fetch(rel, dest)
+                except Exception as exc:
+                    errors[rel] = str(exc) or type(exc).__name__
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        return errors
+
+    def remote_hashes(self, rel_paths: list[str]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        prefix = self.root + "/"
+        for start in range(0, len(rel_paths), 40):
+            chunk = rel_paths[start:start + 40]
+            script = "sha256sum " + " ".join(shlex.quote(self._remote(r)) for r in chunk) + " 2>/dev/null"
+            try:
+                _code, text, _err = _run(self._cmd("shell", script), timeout=1800)
+            except SourceError:
+                continue
+            for line in text.splitlines():
+                digest, _sep, path = line.partition("  ")
+                if len(digest) == 64 and path.startswith(prefix):
+                    out[path[len(prefix):]] = digest.lower()
+        return out

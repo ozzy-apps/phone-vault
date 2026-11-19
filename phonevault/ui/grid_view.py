@@ -85,6 +85,15 @@ class GridDelegate(QStyledItemDelegate):
         if f.confidence == Confidence.GUESS:
             p.setBrush(QColor(t.warning))
             p.drawEllipse(QPointF(tile.right() - 10, tile.top() + 10), 4, 4)
+        if f.backed_up:
+            c = QPointF(tile.right() - 12, tile.bottom() - 12)
+            p.setPen(QPen(QColor(t.field), 2))
+            p.setBrush(QColor(t.accent))
+            p.drawEllipse(c, 7, 7)
+            p.setPen(QPen(QColor(t.accent_text), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(Qt.NoBrush)
+            p.drawPolyline([QPointF(c.x() - 3.2, c.y() + 0.2), QPointF(c.x() - 0.8, c.y() + 2.6),
+                            QPointF(c.x() + 3.4, c.y() - 2.4)])
 
         # name
         p.setPen(QColor(t.text))

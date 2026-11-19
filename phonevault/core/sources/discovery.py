@@ -13,8 +13,14 @@ from .folder import FolderSource
 
 _STATE_NOTES = {
     "unauthorized": "Unlock the phone and allow USB debugging",
-    "offline": "Device offline — reconnect the cable",
-    "no permissions": "No USB permission — add udev rules (see README)",
+    "authorizing": "Waiting for you to allow USB debugging on the phone",
+    "connecting": "Connecting…",
+    "offline": "Offline: reconnect the cable",
+    "no permissions": "No USB permission: open Help → Connection check",
+    "recovery": "Phone is in recovery mode",
+    "sideload": "Phone is in sideload mode",
+    "bootloader": "Phone is in bootloader mode",
+    "rescue": "Phone is in rescue mode",
 }
 
 
@@ -25,6 +31,7 @@ class SourceDescriptor:
     label: str
     ready: bool = True
     note: str = ""
+    emulator: bool = False
 
     @property
     def key(self) -> str:
@@ -68,13 +75,17 @@ def discover_sources(adb_path: str = "", extra_folders: list[str] | None = None)
     adb = find_adb(adb_path)
     if adb:
         try:
-            for dev in list_adb_devices(adb):
+            devices = list_adb_devices(adb)
+            # Real phones first; an Android Studio emulator is never the default pick.
+            devices.sort(key=lambda d: d["emulator"])
+            for dev in devices:
                 ready = dev["state"] == "device"
                 name = dev["model"] or dev["serial"]
-                via = "Wi-Fi" if dev["transport"] == "wifi" else "USB"
+                via = "Emulator" if dev["emulator"] else ("ADB · Wi-Fi" if dev["transport"] == "wifi" else "ADB · USB")
                 found.append(
-                    SourceDescriptor("adb", dev["serial"], f"{name} (ADB · {via})", ready,
-                                     "" if ready else _STATE_NOTES.get(dev["state"], dev["state"]))
+                    SourceDescriptor("adb", dev["serial"], f"{name} ({via})", ready,
+                                     "" if ready else _STATE_NOTES.get(dev["state"], dev["state"]),
+                                     dev["emulator"])
                 )
         except SourceError:
             pass

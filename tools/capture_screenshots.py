@@ -19,12 +19,18 @@ sys.path.insert(0, str(ROOT))
 TMP = Path(tempfile.mkdtemp(prefix="pv-shots-"))
 os.environ["XDG_CONFIG_HOME"] = str(TMP / "config")
 os.environ["XDG_CACHE_HOME"] = str(TMP / "cache")
+os.environ["HOME"] = str(TMP / "home")  # backups land in a throwaway ~/Phone Vault
+(TMP / "home").mkdir()
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QItemSelectionModel  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from phonevault.core.models import Category  # noqa: E402
+from phonevault.core.backup import Archive, BackupOptions, run_backup  # noqa: E402
+from phonevault.core.diagnostics import ConnectionReport, UsbDevice, diagnose  # noqa: E402
+from phonevault.core.models import CATEGORY_INFO, Category  # noqa: E402
+from phonevault.core.sources.adb import parse_adb_devices  # noqa: E402
+from phonevault.core.sources.base import DeviceInfo  # noqa: E402
 from phonevault.core.scanner import run_scan  # noqa: E402
 from phonevault.core.settings import Settings  # noqa: E402
 from phonevault.core.sources import FolderSource, SourceDescriptor  # noqa: E402
@@ -51,6 +57,7 @@ def main() -> int:
 
     settings = Settings()
     win = MainWindow(settings)
+    win.device_timer.stop()  # no real phones here; keep the fake one selected
     win.resize(1480, 900)
     win.show()
     pump(1.0)
@@ -61,8 +68,16 @@ def main() -> int:
     source = FolderSource(phone, "Pixel 8")
     result = run_scan(source, win.settings)
     result.source_label = "Pixel 8"
-    win._on_scan_done(source, result)
+    result.device = DeviceInfo("Google", "Pixel 8")
+    win._on_scan_done(source, result, desc)
     pump(0.5)
+    # Back up everything in "Yours" so the badges and the Backup section show real numbers.
+    yours = [f for f in result.files if CATEGORY_INFO[f.category].group == "Yours"]
+    opts = BackupOptions(win.settings.backup_root_path(), win._device_folder())
+    win.archive = Archive(opts.root, opts.device_folder)
+    win._on_backup_done(run_backup(source, yours, opts))
+    win._update_scan_enabled()
+    pump(0.3)
 
     def wait_thumbs():
         for _ in range(40):
@@ -84,6 +99,34 @@ def main() -> int:
     wait_thumbs()
     pump(1.0)
     win.grab().save(str(out / "library-grid.png"))
+
+    # Backup dialog for the rest
+    from phonevault.ui.backup_dialog import BackupDialog
+    bd = BackupDialog(result.files, win.settings, win._device_folder(), win._device_folder(), win.theme, win)
+    bd.resize(680, bd.sizeHint().height())
+    bd.show()
+    pump(0.6)
+    bd.grab().save(str(out / "backup-dialog.png"))
+    bd.close()
+
+    # Connection check, with a phone that still has to allow USB debugging
+    from phonevault.ui.connection_dialog import ConnectionDialog
+    import phonevault.ui.connection_dialog as cd
+    cd.run_task = lambda *a, **k: None  # don't run a real check
+    report = ConnectionReport(
+        "/home/you/Android/Sdk/platform-tools/adb", "35.0.2", [("/home/you/Android/Sdk/platform-tools/adb", "35.0.2"),
+                                                              ("/usr/bin/adb", "1.0.41")],
+        "", "", parse_adb_devices("R5CT1234 unauthorized usb:1-3 transport_id:4"),
+        [UsbDevice("1-3", "04e8", "6860", "SAMSUNG", "SAMSUNG_Android", "R5CT1234", True, True)], [], True, True, [],
+    )
+    report.findings = diagnose(report)
+    cdlg = ConnectionDialog(win.theme, "", win)
+    cdlg._show(report)
+    cdlg.resize(640, 520)
+    cdlg.show()
+    pump(0.6)
+    cdlg.grab().save(str(out / "connection-check.png"))
+    cdlg.close()
 
     # 2. Received photos in the list view
     win._on_view("list")
