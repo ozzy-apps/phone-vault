@@ -8,8 +8,8 @@ from ..core.models import CATEGORY_INFO, Category, Confidence, Kind, MediaFile, 
 from . import icons
 from .themes import Theme
 
-COLUMNS = ("Name", "Category", "Origin", "Date", "Size", "Match", "Folder")
-COL_NAME, COL_CATEGORY, COL_ORIGIN, COL_DATE, COL_SIZE, COL_MATCH, COL_FOLDER = range(len(COLUMNS))
+COLUMNS = ("Name", "Category", "Origin", "Date", "Size", "Match", "Backup", "Folder")
+COL_NAME, COL_CATEGORY, COL_ORIGIN, COL_DATE, COL_SIZE, COL_MATCH, COL_BACKUP, COL_FOLDER = range(len(COLUMNS))
 SORT_ROLE = Qt.UserRole + 1
 FILE_ROLE = Qt.UserRole + 2
 
@@ -67,6 +67,8 @@ class FileTableModel(QAbstractTableModel):
                 return human_size(f.size)
             if col == COL_MATCH:
                 return f.confidence.label
+            if col == COL_BACKUP:
+                return "Backed up" if f.backed_up else ""
             if col == COL_FOLDER:
                 return f.folder
         elif role == SORT_ROLE:
@@ -78,6 +80,8 @@ class FileTableModel(QAbstractTableModel):
                 return CATEGORY_INFO[f.category].order
             if col == COL_MATCH:
                 return list(Confidence).index(f.confidence)
+            if col == COL_BACKUP:
+                return 1 if f.backed_up else 0
             return (self.data(index, Qt.DisplayRole) or "").lower()
         elif role == FILE_ROLE:
             return f
@@ -90,9 +94,13 @@ class FileTableModel(QAbstractTableModel):
                 return f.rel_path
             if col == COL_DATE:
                 return f"From {f.date_source}" if f.date_source else None
+            if col == COL_BACKUP and f.backed_up:
+                return f"{f.backup_dest}\nBacked up {f.backed_up_at.replace('T', ' ')}"
         elif role == Qt.ForegroundRole:
             if col == COL_MATCH and f.confidence == Confidence.GUESS:
                 return QColor(self.theme.warning)
+            if col == COL_BACKUP:
+                return QColor(self.theme.accent)
             if col in (COL_FOLDER, COL_MATCH, COL_DATE, COL_SIZE):
                 return QColor(self.theme.text_muted)
         elif role == Qt.FontRole and col in (COL_DATE, COL_SIZE) and self.mono is not None:
@@ -107,6 +115,7 @@ class FileFilterProxy(QSortFilterProxyModel):
         super().__init__(parent)
         self._categories: set[Category] | None = None
         self._confidence: Confidence | None = None
+        self._backed_up: bool | None = None
         self._needle = ""
         self.setSortRole(SORT_ROLE)
         self.setDynamicSortFilter(False)
@@ -119,6 +128,10 @@ class FileFilterProxy(QSortFilterProxyModel):
         self._confidence = conf
         self.invalidateFilter()
 
+    def set_backup_state(self, backed_up: bool | None) -> None:
+        self._backed_up = backed_up
+        self.invalidateFilter()
+
     def set_text(self, text: str) -> None:
         self._needle = text.strip().lower()
         self.invalidateFilter()
@@ -129,6 +142,8 @@ class FileFilterProxy(QSortFilterProxyModel):
         if self._categories is not None and f.category not in self._categories:
             return False
         if self._confidence is not None and f.confidence != self._confidence:
+            return False
+        if self._backed_up is not None and f.backed_up != self._backed_up:
             return False
         if self._needle:
             hay = f"{f.rel_path} {f.origin} {f.camera} {f.reason} {f.category_label}".lower()
@@ -165,7 +180,7 @@ class FileTable(QTableView):
     def default_widths(self, scale: float) -> None:
         h = self.horizontalHeader()
         h.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
-        for col, w in ((COL_CATEGORY, 130), (COL_ORIGIN, 120), (COL_DATE, 130), (COL_SIZE, 72),
-                       (COL_MATCH, 62), (COL_FOLDER, 180)):
+        for col, w in ((COL_CATEGORY, 130), (COL_ORIGIN, 110), (COL_DATE, 125), (COL_SIZE, 70),
+                       (COL_MATCH, 60), (COL_BACKUP, 82), (COL_FOLDER, 170)):
             self.setColumnWidth(col, int(w * scale))
         h.setMinimumSectionSize(int(48 * scale))

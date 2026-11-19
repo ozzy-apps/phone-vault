@@ -53,6 +53,23 @@ class Source(ABC):
     def fetch(self, rel_path: str, dest: Path) -> Path:
         """Copy a file to ``dest`` (a file path) and return it."""
 
+    def fetch_many(self, items: list[tuple[str, Path]]) -> dict[str, str]:
+        """Copy several files. Returns {rel_path: error} for the ones that failed."""
+        errors: dict[str, str] = {}
+        for rel_path, dest in items:
+            try:
+                self.fetch(rel_path, dest)
+            except Exception as exc:  # keep going; the caller reports per file
+                errors[rel_path] = str(exc) or type(exc).__name__
+        return errors
+
+    def remote_hashes(self, rel_paths: list[str]) -> dict[str, str]:
+        """SHA-256 of files as stored on the phone. Missing entries mean "couldn't hash"."""
+        return {}
+
+    #: True when fetch_many is faster than single fetches (one adb call for many files).
+    batches: bool = False
+
     def local_path(self, rel_path: str) -> Path | None:
         """Direct path on this computer, if the source is a mounted folder."""
         return None

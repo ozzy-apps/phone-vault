@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThread, QThreadPool, Signal
 from PySide6.QtGui import QImage, QImageReader
 
+from ..core.backup import BackupCancelled, BackupOptions, run_backup
 from ..core.metadata import ImageProbe, probe_with_reader
 from ..core.models import Kind, MediaFile
 from ..core.scanner import ScanCancelled, run_scan
@@ -39,6 +40,30 @@ class ScanThread(QThread):
             self.failed.emit("Scan stopped")
         except SourceError as exc:
             self.failed.emit(str(exc))
+        except Exception as exc:  # pragma: no cover - surfaced in the UI
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+        else:
+            self.succeeded.emit(result)
+
+
+class BackupThread(QThread):
+    progress = Signal(int, int, int, int, str)
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, source: Source, files: list[MediaFile], opts: BackupOptions, parent=None):
+        super().__init__(parent)
+        self.source, self.files, self.opts = source, files, opts
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        try:
+            result = run_backup(self.source, self.files, self.opts, self.progress.emit, self._cancel.is_set)
+        except BackupCancelled:
+            self.failed.emit("Backup stopped")
         except Exception as exc:  # pragma: no cover - surfaced in the UI
             self.failed.emit(f"{type(exc).__name__}: {exc}")
         else:

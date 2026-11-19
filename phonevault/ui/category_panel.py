@@ -230,3 +230,40 @@ class MatchPanel(NavList):
         items = self.selectedItems()
         key = items[0].data(0, ROLE) if items else ("any", None)
         self.selection_changed.emit(key[1] if key[0] == "conf" else None)
+
+
+class BackupPanel(NavList):
+    """Filter by backup state."""
+
+    selection_changed = Signal(object)  # None, True (backed up) or False (not yet)
+
+    def __init__(self, theme: Theme, parent=None):
+        super().__init__(theme, parent)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.itemSelectionChanged.connect(self._emit)
+
+    def populate(self, files: list[MediaFile]) -> None:
+        current = self.selectedItems()[0].data(0, ROLE) if self.selectedItems() else ("any", None)
+        done = [f for f in files if f.backed_up]
+        todo = [f for f in files if not f.backed_up]
+        self.blockSignals(True)
+        self.clear()
+        if files:
+            self.add_section("Backup")
+            restore = self.add_entry("Any", ("any", None), f"{len(files):,}")
+            new = self.add_entry("Not backed up", ("state", False), f"{len(todo):,}",
+                                 human_size(sum(f.size for f in todo)))
+            old = self.add_entry("Backed up", ("state", True), f"{len(done):,}",
+                                 human_size(sum(f.size for f in done)), self.theme.accent)
+            restore = {("state", False): new, ("state", True): old}.get(current, restore)
+            restore.setSelected(True)
+            self.setCurrentItem(restore)
+        self.setFixedHeight(self.content_height() if files else 0)
+        self.blockSignals(False)
+        self._emit()
+
+    def _emit(self) -> None:
+        items = self.selectedItems()
+        key = items[0].data(0, ROLE) if items else ("any", None)
+        self.selection_changed.emit(key[1] if key[0] == "state" else None)
+

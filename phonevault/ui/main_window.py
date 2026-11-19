@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import APP_NAME, __version__
+from ..core.backup import Archive, BackupResult, default_device_folder
 from ..core.classifier import classify_all
 from ..core.models import MediaFile, human_size
 from ..core.scanner import ScanResult
@@ -19,7 +21,9 @@ from ..core.settings import Settings
 from ..core.sources import SourceDescriptor, SourceError, discover_sources, find_adb, open_source
 from . import icons
 from .branding import AppMark, app_icon
-from .category_panel import CategoryPanel, MatchPanel
+from .backup_dialog import BackupDialog
+from .category_panel import BackupPanel, CategoryPanel, MatchPanel
+from .connection_dialog import ConnectionDialog
 from .details_panel import DetailsPanel
 from .file_view import COL_DATE, COL_NAME, COL_SIZE, FILE_ROLE, FileFilterProxy, FileTable, FileTableModel
 from .grid_view import FileGrid
@@ -29,7 +33,7 @@ from .style import apply_theme, mono_font
 from .themes import all_themes, resolve_theme
 from .thumbnails import ThumbnailCache
 from .widgets import DevicePill, Segmented
-from .workers import ScanThread, local_copy, run_task
+from .workers import BackupThread, ScanThread, local_copy, run_task
 
 SORT_COLUMNS = {"date": (COL_DATE, Qt.DescendingOrder), "name": (COL_NAME, Qt.AscendingOrder),
                 "size": (COL_SIZE, Qt.DescendingOrder)}
@@ -45,6 +49,12 @@ class MainWindow(QMainWindow):
         self.result: ScanResult | None = None
         self.source = None
         self.scan_thread: ScanThread | None = None
+        self.backup_thread: BackupThread | None = None
+        self.scan_desc: SourceDescriptor | None = None
+        self.archive: Archive | None = None
+        self._polling = False
+        self._device_signature: tuple = ()
+        self._backup_started = 0.0
         self.adb_path: str | None = find_adb(settings.adb_path)
         self.setWindowTitle(APP_NAME)
         self.resize(1360, 860)
@@ -56,6 +66,11 @@ class MainWindow(QMainWindow):
         self.apply_settings(settings, initial=True)
         self._restore_window()
         QTimer.singleShot(0, self.refresh_devices)
+        # Phones plugged in (or authorised) later show up on their own.
+        self.device_timer = QTimer(self)
+        self.device_timer.setInterval(3000)
+        self.device_timer.timeout.connect(self._poll_devices)
+        self.device_timer.start()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -86,6 +101,7 @@ class MainWindow(QMainWindow):
         self.device.choose_folder.connect(self.choose_folder)
         self.device.refresh.connect(self.refresh_devices)
         tl.addWidget(self.device)
+        self.device.check.connect(self.open_connection_check)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.stop_scan)
         self.stop_btn.hide()
@@ -94,6 +110,12 @@ class MainWindow(QMainWindow):
         self.scan_btn.setObjectName("Primary")
         self.scan_btn.clicked.connect(self.start_scan)
         tl.addWidget(self.scan_btn)
+        self.backup_btn = QPushButton("Back up")
+        self.backup_btn.setObjectName("Primary")
+        self.backup_btn.setToolTip("Copy new files to this computer (Ctrl+B)")
+        self.backup_btn.clicked.connect(self.start_backup)
+        self.backup_btn.hide()
+        tl.addWidget(self.backup_btn)
         self.settings_btn = QToolButton()
         self.settings_btn.setObjectName("Flat")
         self.settings_btn.setToolTip("Settings (Ctrl+,)")
@@ -117,11 +139,15 @@ class MainWindow(QMainWindow):
         self.categories = CategoryPanel(t)
         self.categories.selection_changed.connect(self._on_categories)
         sl.addWidget(self.categories, 1)
+        self.backups = BackupPanel(t)
+        self.backups.selection_changed.connect(self._on_backup_filter)
+        self.backups.setFixedHeight(0)
+        sl.addWidget(self.backups)
         self.matches = MatchPanel(t)
         self.matches.selection_changed.connect(self._on_match)
         self.matches.setFixedHeight(0)
         sl.addWidget(self.matches)
-        side.setMinimumWidth(250)
+        side.setMinimumWidth(260)
         self.splitter.addWidget(side)
 
         # Centre: library
@@ -209,12 +235,13 @@ class MainWindow(QMainWindow):
         self.details = DetailsPanel(t)
         self.details.open_requested.connect(self.open_file)
         self.details.reveal_requested.connect(self.reveal_file)
+        self.details.reveal_backup_requested.connect(self.reveal_backup)
         self.details.setMinimumWidth(270)
         self.splitter.addWidget(self.details)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 0)
-        self.splitter.setSizes([285, 760, 320])
+        self.splitter.setSizes([300, 750, 320])
         self.setCentralWidget(central)
 
         # Status bar
@@ -256,6 +283,9 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         folder = QPushButton("Choose folder…")
         folder.clicked.connect(self.choose_folder)
+        check = QPushButton("Connection check")
+        check.clicked.connect(self.open_connection_check)
+        row.addWidget(check)
         self.empty_scan = QPushButton("Scan")
         self.empty_scan.setObjectName("Primary")
         self.empty_scan.clicked.connect(self.start_scan)
@@ -292,6 +322,12 @@ class MainWindow(QMainWindow):
         folder = file_menu.addAction("Choose folder…", self.choose_folder)
         folder.setShortcut(QKeySequence("Ctrl+O"))
         file_menu.addSeparator()
+        self.act_backup = file_menu.addAction("Back up…", self.start_backup)
+        self.act_backup.setShortcut(QKeySequence("Ctrl+B"))
+        self.act_backup.setEnabled(False)
+        self.act_open_backup = file_menu.addAction("Open backup folder", self.open_backup_folder)
+        self.act_open_backup.setEnabled(False)
+        file_menu.addSeparator()
         export = file_menu.addAction("Export shown files as CSV…", self.export_csv)
         export.setShortcut(QKeySequence("Ctrl+E"))
         file_menu.addSeparator()
@@ -315,9 +351,10 @@ class MainWindow(QMainWindow):
         self.theme_menu.aboutToShow.connect(self._fill_theme_menu)
 
         help_menu = mb.addMenu("Help")
+        help_menu.addAction("Connection check…", self.open_connection_check)
         help_menu.addAction("Connecting your phone", self._show_connect_help)
         help_menu.addAction(f"About {APP_NAME}", self._show_about)
-        for act in (self.act_scan, self.act_stop, refresh, folder, export, prefs, quit_, self.act_grid,
+        for act in (self.act_scan, self.act_stop, refresh, folder, self.act_backup, export, prefs, quit_, self.act_grid,
                     self.act_list, self.act_details, find):
             self.addAction(act)
 
@@ -334,7 +371,8 @@ class MainWindow(QMainWindow):
         self.model.mono = mono
         self.categories.mono = mono
         self.matches.mono = mono
-        for widget in (self.model, self.categories, self.matches, self.grid, self.band, self.details, self.mark,
+        self.backups.mono = mono
+        for widget in (self.model, self.categories, self.matches, self.backups, self.grid, self.band, self.details, self.mark,
                        self.device):
             widget.set_theme(t)
         self.sort_seg.set_value(s.sort_key)
@@ -391,15 +429,34 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- devices
     def refresh_devices(self) -> None:
         self.device.set_searching()
+        self._device_signature = ()
+        self._polling = True
         run_task(discover_sources, self.settings.adb_path, list(self.settings.recent_folders),
                  on_done=self._on_devices, on_fail=lambda _e: self._on_devices(([], self.adb_path)))
 
+    def _poll_devices(self) -> None:
+        if self._polling or not self.isVisible():
+            return
+        self._polling = True
+        run_task(discover_sources, self.settings.adb_path, list(self.settings.recent_folders),
+                 on_done=self._on_devices, on_fail=lambda _e: setattr(self, "_polling", False))
+
     def _on_devices(self, result) -> None:
+        self._polling = False
         devices, adb = result
+        signature = (adb, tuple((d.key, d.ready, d.note) for d in devices))
+        if signature == self._device_signature:
+            return
+        self._device_signature = signature
         self.adb_path = adb
         self._update_empty_text()
         self.device.set_devices(devices, self.settings.last_source)
         self._update_scan_enabled()
+
+    def open_connection_check(self) -> None:
+        dlg = ConnectionDialog(self.theme, self.settings.adb_path, self)
+        dlg.devices_changed.connect(self.refresh_devices)
+        dlg.exec()
 
     def _on_device_selected(self, desc: SourceDescriptor) -> None:
         if desc.ready and self.settings.last_source != desc.key:
@@ -417,17 +474,36 @@ class MainWindow(QMainWindow):
         desc = SourceDescriptor("folder", folder, f"{Path(folder).name or folder} (folder)")
         self.device.add_and_select(desc)
 
+    @property
+    def busy(self) -> bool:
+        return self.scan_thread is not None or self.backup_thread is not None
+
     def _update_scan_enabled(self) -> None:
         d = self.device.current
-        ok = d is not None and d.ready and self.scan_thread is None
+        ok = d is not None and d.ready and not self.busy
         self.scan_btn.setEnabled(ok)
         self.empty_scan.setEnabled(ok)
         self.act_scan.setEnabled(ok)
+        can_backup = self.result is not None and self.source is not None and not self.busy
+        self.backup_btn.setEnabled(can_backup)
+        self.act_backup.setEnabled(can_backup)
+        self.act_open_backup.setEnabled(self.archive is not None and self.archive.base.exists())
+        # One primary action at a time: Scan before the first scan, Back up after it.
+        self.backup_btn.setVisible(self.result is not None)
+        self._set_primary(self.scan_btn, self.result is None)
+
+    @staticmethod
+    def _set_primary(button: QPushButton, primary: bool) -> None:
+        name = "Primary" if primary else ""
+        if button.objectName() != name:
+            button.setObjectName(name)
+            button.style().unpolish(button)
+            button.style().polish(button)
 
     # ----------------------------------------------------------------- scan
     def start_scan(self) -> None:
         desc = self.device.current
-        if desc is None or not desc.ready or self.scan_thread is not None:
+        if desc is None or not desc.ready or self.busy:
             return
         try:
             source = open_source(desc, self.settings.adb_path)
@@ -436,7 +512,7 @@ class MainWindow(QMainWindow):
             return
         self.scan_thread = ScanThread(source, self.settings, self)
         self.scan_thread.progress.connect(self._on_progress)
-        self.scan_thread.succeeded.connect(lambda r, src=source: self._on_scan_done(src, r))
+        self.scan_thread.succeeded.connect(lambda r, src=source, d=desc: self._on_scan_done(src, r, d))
         self.scan_thread.failed.connect(self._on_scan_failed)
         self.scan_thread.finished.connect(self._on_thread_finished)
         self.progress.setRange(0, 0)
@@ -448,9 +524,10 @@ class MainWindow(QMainWindow):
         self.scan_thread.start()
 
     def stop_scan(self) -> None:
-        if self.scan_thread is not None:
-            self.scan_thread.cancel()
-            self._status("Stopping…")
+        for thread in (self.scan_thread, self.backup_thread):
+            if thread is not None:
+                thread.cancel()
+                self._status("Stopping after the current file…" if thread is self.backup_thread else "Stopping…")
 
     def _on_progress(self, phase: str, done: int, total: int) -> None:
         if total:
@@ -461,11 +538,14 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 0)
             self._status(f"{PHASE_LABELS.get(phase, phase)}" + (f" · {done:,}" if done else ""))
 
-    def _on_scan_done(self, source, result: ScanResult) -> None:
+    def _on_scan_done(self, source, result: ScanResult, desc: SourceDescriptor | None = None) -> None:
         self.source = source
         self.result = result
+        self.scan_desc = desc
         self.thumbs.set_source(source)
         self.details.set_source(source)
+        self.archive = Archive(self.settings.backup_root_path(), self._device_folder())
+        self.archive.mark(result.files)
         self._show_result(result)
         self._status(f"Scanned {result.source_label} in {result.duration:.1f} s · "
                      f"{result.probed:,} files read for metadata · {result.skipped:,} skipped")
@@ -486,6 +566,7 @@ class MainWindow(QMainWindow):
         self.model.set_files(result.files)
         self.categories.populate(result.files, keep_selection=keep_selection)
         self.matches.populate(result.files)
+        self.backups.populate(result.files)
         self.band.set_files(result.files)
         self._apply_sort(self.settings.sort_key)
         self.title.setText(result.source_label)
@@ -495,6 +576,7 @@ class MainWindow(QMainWindow):
         self._set_library_visible(True)
         self._update_count()
         self.details.clear()
+        self._update_scan_enabled()
 
     def _set_library_visible(self, visible: bool) -> None:
         for w in (self.sort_seg, self.size_seg, self.view_seg, self.export_btn, self.search, self.band):
@@ -509,6 +591,10 @@ class MainWindow(QMainWindow):
     def _on_categories(self, cats) -> None:
         self.proxy.set_categories(cats)
         self.band.set_highlight(cats)
+        self._update_count()
+
+    def _on_backup_filter(self, state) -> None:
+        self.proxy.set_backup_state(state)
         self._update_count()
 
     def _on_match(self, conf) -> None:
@@ -590,6 +676,107 @@ class MainWindow(QMainWindow):
         if path is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
+    # --------------------------------------------------------------- backup
+    def _device_folder(self) -> str:
+        key = self.scan_desc.key if self.scan_desc else ""
+        if key and key in self.settings.device_folders:
+            return self.settings.device_folders[key]
+        if self.result is None:
+            return "Phone"
+        return default_device_folder(self.result.source_label, self.result.device)
+
+    def start_backup(self) -> None:
+        if self.result is None or self.source is None or self.busy:
+            return
+        folder = self._device_folder()
+        dlg = BackupDialog(self.result.files, self.settings, folder, folder, self.theme, self)
+        if dlg.exec() != BackupDialog.Accepted or dlg.plan is None or not dlg.plan.to_copy:
+            return
+        opts = dlg.options()
+        s = dlg.updated_settings()
+        if self.scan_desc is not None:
+            s.device_folders[self.scan_desc.key] = opts.device_folder
+        s.window_geometry, s.splitter_state = self.settings.window_geometry, self.settings.splitter_state
+        self.settings = s
+        s.save()
+        if self.archive is None or self.archive.base != Archive(opts.root, opts.device_folder).base:
+            # Another destination or folder: re-read what that archive already has.
+            self.archive = Archive(opts.root, opts.device_folder)
+            self.archive.mark(self.result.files)
+        files = [f for f in dlg.plan.to_copy if not f.backed_up]
+        self.backup_thread = BackupThread(self.source, files, opts, self)
+        self.backup_thread.progress.connect(self._on_backup_progress)
+        self.backup_thread.succeeded.connect(self._on_backup_done)
+        self.backup_thread.failed.connect(self._on_backup_failed)
+        self.backup_thread.finished.connect(self._on_backup_thread_finished)
+        self._backup_started = time.monotonic()
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.progress.show()
+        self.stop_btn.show()
+        self.act_stop.setEnabled(True)
+        self._status(f"Backing up {len(files):,} files to {opts.root / opts.device_folder}")
+        self._update_scan_enabled()
+        self.backup_thread.start()
+
+    def _on_backup_progress(self, done: int, total: int, done_bytes: int, total_bytes: int, name: str) -> None:
+        self.progress.setValue(int(1000 * done_bytes / total_bytes) if total_bytes else 0)
+        elapsed = max(0.001, time.monotonic() - self._backup_started)
+        speed = done_bytes / elapsed
+        parts = [f"Backing up {done:,} / {total:,}", f"{human_size(done_bytes)} / {human_size(total_bytes)}"]
+        if done_bytes and elapsed > 2:
+            parts.append(f"{human_size(speed)}/s")
+            left = (total_bytes - done_bytes) / speed if speed else 0
+            parts.append(f"{int(left // 60)} min left" if left >= 90 else f"{int(left)} s left")
+        if name:
+            parts.append(name)
+        self._status(" · ".join(parts))
+        if done and done % 25 == 0:
+            self.grid.viewport().update()
+
+    def _on_backup_done(self, result: BackupResult) -> None:
+        files = self.result.files if self.result else []
+        self.model.refresh()
+        self.backups.populate(files)
+        self.details.refresh()
+        self.grid.viewport().update()
+        verb = "Backup stopped" if result.cancelled else "Backup finished"
+        parts = [f"{verb}: {result.copied:,} copied ({human_size(result.copied_bytes)})"]
+        if result.reused:
+            parts.append(f"{result.reused:,} already in the archive")
+        if result.failed:
+            parts.append(f"{len(result.failed):,} failed")
+        parts.append(f"{result.duration:.0f} s")
+        self._status(" · ".join(parts))
+        if result.failed:
+            lines = "\n".join(f"{f.rel_path}: {err}" for f, err in result.failed[:12])
+            more = f"\n…and {len(result.failed) - 12:,} more" if len(result.failed) > 12 else ""
+            box = QMessageBox(QMessageBox.Warning, "Some files weren't backed up",
+                              f"{len(result.failed):,} files couldn't be copied. Run Back up again to retry them.",
+                              QMessageBox.Ok, self)
+            box.setDetailedText(lines + more)
+            box.exec()
+
+    def _on_backup_failed(self, message: str) -> None:
+        self._status(message)
+        if message != "Backup stopped":
+            QMessageBox.warning(self, "Backup failed", message)
+
+    def _on_backup_thread_finished(self) -> None:
+        self.backup_thread = None
+        self.progress.hide()
+        self.stop_btn.hide()
+        self.act_stop.setEnabled(False)
+        self._update_scan_enabled()
+
+    def open_backup_folder(self) -> None:
+        if self.archive is not None and self.archive.base.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.archive.base)))
+
+    def reveal_backup(self, f: MediaFile) -> None:
+        if f.backup_dest:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(f.backup_dest).parent)))
+
     # --------------------------------------------------------------- export
     def export_csv(self) -> None:
         if self.result is None:
@@ -638,6 +825,15 @@ class MainWindow(QMainWindow):
             self.splitter.restoreState(QByteArray.fromBase64(self.settings.splitter_state.encode()))
 
     def closeEvent(self, e):
+        if self.backup_thread is not None:
+            answer = QMessageBox.question(self, "Backup running",
+                                          "Stop the backup and quit? Files copied so far are kept.")
+            if answer != QMessageBox.Yes:
+                e.ignore()
+                return
+            self.backup_thread.cancel()
+            self.backup_thread.wait(60000)
+        self.device_timer.stop()
         if self.scan_thread is not None:
             self.scan_thread.cancel()
             self.scan_thread.wait(3000)
